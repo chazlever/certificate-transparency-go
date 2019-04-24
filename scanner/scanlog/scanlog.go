@@ -59,7 +59,7 @@ var (
 	startIndex    = flag.Int64("start_index", 0, "Log index to start scanning at")
 	endIndex      = flag.Int64("end_index", 0, "Log index to end scanning at (non-inclusive, 0 = end of log)")
 
-	printJson   = flag.Bool("print_json", false, "If true prints the whole chain in JSON rather than a summary")
+	printEntry   = flag.Bool("print_entry", false, "If true prints the whole log entry in JSON rather than a summary")
 	printChains = flag.Bool("print_chains", false, "If true prints the whole chain rather than a summary")
 	dumpDir     = flag.String("dump_dir", "", "Directory to store matched certificates in")
 )
@@ -136,9 +136,10 @@ func logFullChain(entry *ct.RawLogEntry) {
 	log.Printf("Index %d: Chain: %s", entry.Index, chainToString(entry.Chain))
 }
 
-func logFullChainToJson(entry *ct.RawLogEntry) {
-	if logEntry, err := entry.ToLogEntry(); err == nil {
-		log.Printf("%s", json.Marshal(logEntry))
+func logEntryToJson(entry *ct.RawLogEntry) {
+	logEntry, _ := entry.ToLogEntry()
+	if jsonEntry, err := json.Marshal(logEntry); err == nil {
+		log.Printf("%s", jsonEntry)
 	}
 }
 
@@ -228,8 +229,8 @@ func main() {
 	ctx := context.Background()
 	if *printChains {
 		scanner.Scan(ctx, logFullChain, logFullChain)
-	} else if *printJson {
-		scanner.Scan(ctx, logFullChainToJson, logFullChainToJson)
+	} else if *printEntry {
+		scanner.Scan(ctx, logEntryToJson, logEntryToJson)
 	} else {
 		scanner.Scan(ctx, logCertInfo, logPrecertInfo)
 	}
