@@ -166,6 +166,10 @@ func dumpJson(entry *ct.RawLogEntry) {
 
 func jsonToDisk(jsonStream <-chan []byte, wg *sync.WaitGroup) {
 	defer wg.Done()
+	if *jsonDir == "" {
+		return
+	}
+
 	if err := os.MkdirAll(*jsonDir, 0755); err != nil {
 		panic(err)
 	}
