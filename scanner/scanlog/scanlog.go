@@ -15,6 +15,7 @@
 package main
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -24,8 +25,12 @@ import (
 	"log"
 	"math/big"
 	"net/http"
+	"net/url"
+	"os"
 	"path"
 	"regexp"
+	"strings"
+	"sync"
 	"time"
 
 	ct "github.com/google/certificate-transparency-go"
@@ -59,10 +64,51 @@ var (
 	startIndex    = flag.Int64("start_index", 0, "Log index to start scanning at")
 	endIndex      = flag.Int64("end_index", 0, "Log index to end scanning at (non-inclusive, 0 = end of log)")
 
-	printEntry   = flag.Bool("print_entry", false, "If true prints the whole log entry in JSON rather than a summary")
 	printChains = flag.Bool("print_chains", false, "If true prints the whole chain rather than a summary")
 	dumpDir     = flag.String("dump_dir", "", "Directory to store matched certificates in")
+
+	jsonDir    = flag.String("json_dir", "", "Directory to store matched JSON entries in")
+	jsonLines  = flag.Int("json_lines", 10000, "Maximum number of lines per JSON output file")
+	jsonStream chan []byte
 )
+
+// JSONWriter blah blah blah
+type JSONWriter struct {
+	jsonFile   *os.File
+	jsonWriter *gzip.Writer
+}
+
+// Open something something something
+func (j *JSONWriter) Open(filename string) {
+	jsonFile, err := os.Create(filename)
+	if err != nil {
+		panic(err)
+	}
+	j.jsonFile = jsonFile
+	j.jsonWriter = gzip.NewWriter(jsonFile)
+}
+
+// Rotate something something something
+func (j *JSONWriter) Rotate(filename string) {
+	j.Close()
+	j.Open(filename)
+}
+
+// Write something something something
+func (j *JSONWriter) Write(p []byte) (int, error) {
+	return j.jsonWriter.Write(p)
+}
+
+// Close something something something
+func (j *JSONWriter) Close() {
+	if j.jsonWriter != nil {
+		j.jsonWriter.Close()
+	}
+
+	if j.jsonFile != nil {
+		j.jsonFile.Close()
+	}
+}
 
 func dumpData(entry *ct.RawLogEntry) {
 	if *dumpDir == "" {
@@ -98,6 +144,59 @@ func dumpData(entry *ct.RawLogEntry) {
 	}
 }
 
+func dumpJson(entry *ct.RawLogEntry) {
+	if *jsonDir == "" {
+		return
+	}
+
+	logEntry, err := entry.ToLogEntry()
+	if err != nil {
+		log.Printf("Failed to convert RawLogEntry to LogEntry: %s", err)
+		return
+	}
+
+	jsonEntry, err := json.Marshal(logEntry)
+	if err != nil {
+		log.Printf("Failed to marshal log entry: %s", err)
+		return
+	}
+
+	jsonStream <- jsonEntry
+}
+
+func jsonToDisk(jsonStream <-chan []byte, wg *sync.WaitGroup) {
+	defer wg.Done()
+	if err := os.MkdirAll(*jsonDir, 0755); err != nil {
+		panic(err)
+	}
+
+	uri, err := url.Parse(*logURI)
+	if err != nil {
+		panic(err)
+	}
+	uriName := fmt.Sprintf(
+		"%s%s", uri.Host,
+		strings.Replace(uri.Path, "/", "-", -1))
+
+	var jsonWriter JSONWriter
+	defer jsonWriter.Close()
+
+	var (
+		count    int
+		newLine  = []byte("\n")
+	)
+	for s := range jsonStream {
+		if (count % *jsonLines) == 0 {
+			timestamp := time.Now().UTC().UnixNano()
+			filename := fmt.Sprintf("%d-%s.json.gz", timestamp, uriName)
+			jsonWriter.Rotate(path.Join(*jsonDir, filename))
+		}
+		jsonWriter.Write(s)
+		jsonWriter.Write(newLine)
+		count++
+	}
+}
+
 // Prints out a short bit of info about |cert|, found at |index| in the
 // specified log
 func logCertInfo(entry *ct.RawLogEntry) {
@@ -108,6 +207,7 @@ func logCertInfo(entry *ct.RawLogEntry) {
 		log.Printf("Process cert at index %d: CN: '%s'", entry.Index, parsedEntry.X509Cert.Subject.CommonName)
 	}
 	dumpData(entry)
+	dumpJson(entry)
 }
 
 // Prints out a short bit of info about |precert|, found at |index| in the
@@ -120,6 +220,7 @@ func logPrecertInfo(entry *ct.RawLogEntry) {
 		log.Printf("Process precert at index %d: CN: '%s' Issuer: %s", entry.Index, parsedEntry.Precert.TBSCertificate.Subject.CommonName, parsedEntry.Precert.TBSCertificate.Issuer.CommonName)
 	}
 	dumpData(entry)
+	dumpJson(entry)
 }
 
 func chainToString(certs []ct.ASN1Cert) string {
@@ -134,13 +235,6 @@ func chainToString(certs []ct.ASN1Cert) string {
 
 func logFullChain(entry *ct.RawLogEntry) {
 	log.Printf("Index %d: Chain: %s", entry.Index, chainToString(entry.Chain))
-}
-
-func logEntryToJson(entry *ct.RawLogEntry) {
-	logEntry, _ := entry.ToLogEntry()
-	if jsonEntry, err := json.Marshal(logEntry); err == nil {
-		log.Printf("%s", jsonEntry)
-	}
 }
 
 func createRegexes(regexValue string) (*regexp.Regexp, *regexp.Regexp) {
@@ -226,11 +320,19 @@ func main() {
 	}
 	scanner := scanner.NewScanner(logClient, opts)
 
+	// Make sure we don't exit before our goroutine finishes
+	var wg sync.WaitGroup
+	wg.Add(1)
+	defer wg.Wait()
+
+	// We're going to use this to guard access to files
+	jsonStream = make(chan []byte)
+	defer close(jsonStream)
+	go jsonToDisk(jsonStream, &wg)
+
 	ctx := context.Background()
 	if *printChains {
 		scanner.Scan(ctx, logFullChain, logFullChain)
-	} else if *printEntry {
-		scanner.Scan(ctx, logEntryToJson, logEntryToJson)
 	} else {
 		scanner.Scan(ctx, logCertInfo, logPrecertInfo)
 	}
